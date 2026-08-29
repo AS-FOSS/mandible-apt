@@ -73,20 +73,39 @@ echo "indexing ${deb_count} package file(s)"
 rm -rf dists
 for arch in "${ARCHES[@]}"; do
   mkdir -p "dists/${SUITE}/${COMPONENT}/binary-${arch}"
+  index="dists/${SUITE}/${COMPONENT}/binary-${arch}/Packages"
+
+  # --multiversion, and it is not optional here. By default
+  # dpkg-scanpackages emits only the newest version of each package, so a
+  # pool holding every released .deb produced an index listing exactly
+  # one — measured: 26 files in the pool, 1 entry per architecture, and
+  # every older version silently uninstallable. Anything that downloads
+  # more than the latest release must index more than the latest release,
+  # or it is downloading for nothing.
+  #
   # No override file argument. Passing /dev/null as one is the usual
   # incantation, but it makes dpkg-scanpackages warn "Packages in archive
   # but missing from override file" for every package on every run;
   # omitting it entirely is silent and produces byte-identical output.
-  dpkg-scanpackages --arch "$arch" pool \
-    > "dists/${SUITE}/${COMPONENT}/binary-${arch}/Packages"
+  dpkg-scanpackages --multiversion --arch "$arch" pool > "$index"
 
-  if [[ ! -s "dists/${SUITE}/${COMPONENT}/binary-${arch}/Packages" ]]; then
+  if [[ ! -s "$index" ]]; then
     echo "no ${arch} package in the pool — refusing to publish a suite that claims an architecture it cannot serve" >&2
     exit 1
   fi
 
-  gzip -9nkf "dists/${SUITE}/${COMPONENT}/binary-${arch}/Packages"
-  echo "  binary-${arch}: $(grep -c '^Package:' "dists/${SUITE}/${COMPONENT}/binary-${arch}/Packages") package(s)"
+  # Every .deb of this architecture in the pool must appear in the index.
+  # The default-versus-multiversion trap above is silent by construction —
+  # a short index is a valid index — so it is checked rather than trusted.
+  in_pool="$(find pool -name "*_${arch}.deb" -type f | wc -l)"
+  indexed="$(grep -c '^Package:' "$index")"
+  if [[ "$indexed" -ne "$in_pool" ]]; then
+    echo "binary-${arch}: ${in_pool} package file(s) in the pool but ${indexed} in the index — the index does not describe the pool" >&2
+    exit 1
+  fi
+
+  gzip -9nkf "$index"
+  echo "  binary-${arch}: ${indexed} package(s)"
 done
 
 # `apt-ftparchive release` hashes every file it finds under the directory
