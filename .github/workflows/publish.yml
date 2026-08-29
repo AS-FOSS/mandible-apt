@@ -1,0 +1,169 @@
+name: publish
+
+# Rebuild and republish the apt repository.
+#
+# Triggered either by hand (`workflow_dispatch`, naming the tag that
+# prompted it) or by AS-FOSS/mandible's release workflow
+# (`repository_dispatch` of type `release`, with the tag in
+# `client_payload.tag`).
+#
+# The repository is rebuilt from scratch on every run, out of the .deb
+# assets attached to AS-FOSS/mandible's own releases. Nothing is stored
+# here between runs and no packages are committed to this repository.
+#
+# That is a deliberate choice over keeping a pool in git, for three
+# reasons. The releases are already the source of truth for what a version
+# of mandible is, and a second copy in git is a second thing that can be
+# wrong. A stateless rebuild is idempotent and self-healing: if a run is
+# interrupted or a bad index is ever published, the fix is to run this
+# again rather than to repair committed state. And a commit made from CI
+# would be unsigned — this project does not ship unsigned commits, and the
+# way around that (committing through GitHub's GraphQL API so GitHub signs
+# it) would mean base64-ing megabytes of .deb through a mutation on every
+# release to solve a problem that only exists because the state was
+# committed at all.
+#
+# The cost is honest and small: every run re-downloads the .deb assets of
+# the releases it indexes, a few megabytes.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag that prompted this rebuild, e.g. v0.4.5"
+        required: true
+  repository_dispatch:
+    types: [release]
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Never cancel a deploy in flight. Superseding a Pages deployment halfway
+# is how a site ends up serving a half-written index, and for an apt
+# repository that means a signed Release whose Packages file is not the
+# one it was signed over.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: AS-FOSS/mandible
+  # How many of the most recent releases to index. Older versions stay
+  # installable rather than vanishing the moment a new tag lands, which is
+  # the whole reason to run a repository instead of telling people to
+  # download a .deb. Bounded so this job's runtime does not grow without
+  # limit as the project accumulates tags.
+  RELEASES_TO_INDEX: 20
+
+jobs:
+  publish:
+    name: build and deploy the apt repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve the triggering tag
+        run: |
+          tag="${{ inputs.tag || github.event.client_payload.tag }}"
+          if [ -z "$tag" ]; then
+            echo "::error::no tag given — workflow_dispatch needs the 'tag' input, repository_dispatch needs client_payload.tag" >&2
+            exit 1
+          fi
+          echo "TAG=$tag" >> "$GITHUB_ENV"
+          echo "rebuilding because of ${tag}"
+
+      - name: Install the archive tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends dpkg-dev apt-utils gnupg
+
+      # Failing, not skipping. Every other missing-secret path in this
+      # project's release automation degrades to a warning, because the
+      # worst case there is that something is not updated. Here the worst
+      # case is different in kind: an unsigned or wrongly-signed apt
+      # repository is one that either refuses to work for everyone or
+      # teaches people to bypass verification. Publishing nothing is
+      # strictly better.
+      - name: Import the archive signing key
+        env:
+          APT_SIGNING_KEY: ${{ secrets.APT_SIGNING_KEY }}
+        run: |
+          if [ -z "$APT_SIGNING_KEY" ]; then
+            echo "::error::APT_SIGNING_KEY is not set on this repository — refusing to publish an unsigned apt repository. Add the armored private key as that secret and re-run." >&2
+            exit 1
+          fi
+          printf '%s\n' "$APT_SIGNING_KEY" | gpg --batch --quiet --import
+          fpr="$(gpg --batch --with-colons --list-secret-keys --fingerprint | awk -F: '/^fpr:/{print $10; exit}')"
+          if [ -z "$fpr" ]; then
+            echo "::error::APT_SIGNING_KEY was imported but no secret key is present — check that the secret holds an armored *private* key" >&2
+            exit 1
+          fi
+          echo "SIGNING_KEY=$fpr" >> "$GITHUB_ENV"
+          echo "signing as ${fpr}"
+
+      - name: Collect the .deb assets from the upstream releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p site/pool/main/m/mandible
+
+          # Newest first. A release with no .deb assets is skipped rather
+          # than fatal: the early tags predate distro packaging, and a
+          # repository that refuses to build because of a 0.1.0 tag would
+          # be broken by history it cannot change.
+          tags="$(gh release list --repo "$UPSTREAM" \
+                    --limit "$RELEASES_TO_INDEX" \
+                    --json tagName --jq '.[].tagName')"
+
+          for tag in $tags; do
+            if gh release download "$tag" --repo "$UPSTREAM" \
+                 --dir site/pool/main/m/mandible \
+                 --pattern '*.deb' --clobber 2>/dev/null; then
+              echo "  ${tag}: debs collected"
+            else
+              echo "  ${tag}: no .deb assets, skipped"
+            fi
+          done
+
+          # The tag that prompted this run must be in the result. If it is
+          # not, the run would deploy a repository that silently does not
+          # contain the release it was triggered for — which looks like a
+          # success and is the failure this check exists to name.
+          version="${TAG#v}"
+          if ! ls site/pool/main/m/mandible/mandible_${version}-1_*.deb >/dev/null 2>&1; then
+            echo "::error::${TAG} has no .deb assets among the ${RELEASES_TO_INDEX} most recent releases of ${UPSTREAM} — nothing to publish for it" >&2
+            exit 1
+          fi
+
+          ls -1 site/pool/main/m/mandible
+
+      - name: Build the signed repository
+        run: ./build-repo.sh site "$SIGNING_KEY"
+
+      - name: Render the landing page
+        run: ./render-index.sh site "$SIGNING_KEY" > site/index.html
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      - id: deploy
+        uses: actions/deploy-pages@v4
+
+      - name: Summarise
+        run: |
+          {
+            echo "### apt repository published"
+            echo
+            echo "- triggered by \`${TAG}\`"
+            echo "- ${{ steps.deploy.outputs.page_url }}"
+            echo "- signed by \`${SIGNING_KEY}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
